@@ -1,0 +1,37 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode and build output
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test, coverage and tooling caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+
+# Logs, temporary and backup files
+*.log
+*.tmp
+*.bak
+*.old
+*.swp
+
+# Editors, local tool settings and OS files
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db
