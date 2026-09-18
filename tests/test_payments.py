@@ -74,6 +74,42 @@ async def test_openapi_documents_the_payment_endpoint(client: httpx.AsyncClient)
     assert any(p["name"] == "Idempotency-Key" for p in operation["parameters"])
 
 
+async def test_health_endpoint_reports_ok(client: httpx.AsyncClient) -> None:
+    response = await client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+async def test_oversized_body_is_rejected_before_processing(
+    processor: RecordingProcessor,
+) -> None:
+    app = create_app(settings=Settings(max_request_body_bytes=64), processor=processor)
+    async with gateway_client(app) as client:
+        padding = "x" * 200
+        response = await pay(
+            client,
+            "too-big",
+            raw=f'{{"amount": 100, "currency": "GHS", "pad": "{padding}"}}',
+        )
+
+    assert response.status_code == 413
+    assert processor.calls == 0
+
+
+async def test_unhandled_processor_error_returns_generic_json_body() -> None:
+    processor = GatedProcessor(fail=True)
+    app = create_app(settings=Settings(), processor=processor)
+    async with gateway_client(app, raise_app_exceptions=False) as client:
+        first = asyncio.create_task(pay(client, "payment-boom"))
+        await processor.started.wait()
+        processor.release()
+        response = await first
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal Server Error"}
+
+
 # --- User story 1: first transaction --------------------------------------------------
 
 
@@ -159,6 +195,27 @@ async def test_invalid_amount_is_rejected(
     response = await pay(client, "bad-amount", {"amount": amount, "currency": "GHS"})
 
     assert response.status_code == 422
+    assert processor.calls == 0
+    assert store_size(app) == 0
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ['{"amount": NaN, "currency": "GHS"}', '{"amount": Infinity, "currency": "GHS"}', '{"amount": -Infinity, "currency": "GHS"}'],
+    ids=["nan", "positive-infinity", "negative-infinity"],
+)
+async def test_non_finite_amount_is_cleanly_rejected(
+    app: FastAPI, client: httpx.AsyncClient, processor: RecordingProcessor, raw: str
+) -> None:
+    """NaN/Infinity must fail validation with 422, not crash into an unhandled 500.
+
+    Starlette's default JSON encoder rejects non-finite floats (allow_nan=False), so a
+    validation error that echoes the raw invalid value back needs to sanitise it first.
+    """
+    response = await pay(client, "non-finite-amount", raw=raw)
+
+    assert response.status_code == 422
+    assert "finite" in response.text
     assert processor.calls == 0
     assert store_size(app) == 0
 
@@ -314,6 +371,29 @@ async def test_burst_of_identical_requests_is_processed_exactly_once() -> None:
     assert {r.status_code for r in responses} == {200}
     assert len({r.content for r in responses}) == 1
     assert [r.headers["X-Cache-Hit"] for r in responses].count("false") == 1
+
+
+async def test_concurrent_first_use_with_different_bodies_is_deterministic() -> None:
+    """Two requests race to claim a brand-new key with different bodies at the same time.
+
+    Nothing has been stored yet, so this exercises the check-and-reserve race itself
+    (not a duplicate arriving after an owner already exists). Exactly one must become
+    the owner and charge; the other must get 409, never a silently-replayed response
+    for the wrong amount and never a second charge.
+    """
+    processor = RecordingProcessor(delay_seconds=0.05)
+    app = create_app(settings=Settings(), processor=processor)
+    async with gateway_client(app) as client:
+        responses = await asyncio.gather(
+            pay(client, "race-key", {"amount": 100, "currency": "GHS"}),
+            pay(client, "race-key", {"amount": 500, "currency": "GHS"}),
+        )
+
+    statuses = sorted(r.status_code for r in responses)
+    assert statuses == [200, 409]
+    assert processor.calls == 1
+    conflict = next(r for r in responses if r.status_code == 409)
+    assert conflict.json() == {"detail": "Idempotency key already used for a different request body."}
 
 
 async def test_in_flight_request_with_different_body_conflicts_without_waiting() -> None:

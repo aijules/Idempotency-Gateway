@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from decimal import Decimal
 from typing import Annotated, Any
 
@@ -37,9 +38,16 @@ class PaymentRequest(BaseModel):
     @field_validator("amount", mode="before")
     @classmethod
     def reject_non_numeric_amount(cls, value: Any) -> Any:
-        
+
         if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
             raise ValueError("amount must be a JSON number")
+        # JSON's NaN/Infinity/-Infinity tokens decode to non-finite floats. They would
+        # otherwise pass the gt=0 check (Infinity) or blow up on it (NaN raises
+        # decimal.InvalidOperation), so reject them explicitly with a clean 422.
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("amount must be a finite number")
+        if isinstance(value, Decimal) and not value.is_finite():
+            raise ValueError("amount must be a finite number")
         return value
 
     @field_validator("amount")
@@ -59,3 +67,7 @@ class PaymentResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+class HealthResponse(BaseModel):
+    status: str = Field(examples=["ok"])
